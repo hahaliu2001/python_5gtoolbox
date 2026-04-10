@@ -21,7 +21,7 @@ def nr_decode_ldpc(LLRin, Zc, bgn, L, algo='min-sum',alpha=1, beta=0):
     
     """
     assert bgn in [1,2]
-    assert algo in ['BF', 'BP', 'min-sum']
+    assert algo in ['BF', 'BP', 'min-sum', 'layered_BP', 'layered_min-sum']
     
     if bgn == 1:
         N = Zc * 66
@@ -64,6 +64,10 @@ def decode_ldpc(LLRin, H, L, algo='min-sum', alpha=1, beta=0):
     """     
     if algo == "BF":
         ck, status = ldpc_decoder_bit_flipping.ldpc_decoder_BF(LLRin, H, L)
+        return ck, status
+    
+    if algo == "layered_BP" or algo == "layered_min-sum":
+        ck, status = _layered_decode_ldpc(LLRin, H, L, algo=algo, alpha=alpha, beta=beta)
         return ck, status
     
     #for soft decision decoder
@@ -142,6 +146,136 @@ def decode_ldpc(LLRin, H, L, algo='min-sum', alpha=1, beta=0):
     else:
         return ck, False
 
+def _layered_decode_ldpc(LLRin, H, L, algo='min-sum', alpha=1, beta=0):
+    """ LDPC decoder, support BF(bit flipping), BP(belief propagation), min-sum algorithms
+    BP is also named sum-product algorithm
+    input: 
+        LLRin: N length LDPC decoder LLR input data
+        H: LDPC matrix, 
+        L: iteration size
+        algo: one of ["BF", "BP", "min-sum"]
+        alpha: (0:1] used for normalized min-sum. 1 means no normalized
+        beta: >=0 used for offset min-sum, 0 means no offset
+    output:
+        ck: N length LDPC decoded sequence
+        status: True or False
+    """     
+    if algo == "BF":
+        ck, status = ldpc_decoder_bit_flipping.ldpc_decoder_BF(LLRin, H, L)
+        return ck, status
+    
+    #for soft decision decoder
+    M = H.shape[0]
+    N = H.shape[1]
+    
+    #validate
+    assert LLRin.size == N
+
+    #generate A list and B list
+    # A list contain sublist of all variable nodes index that connect to check node j
+    # correspondent to each line of H
+    #for examnple, A[0] is a list of variable nodes index that connect to check node 0
+    A=[]
+    for m in range(M):
+        idxlist = list(np.where(H[m,:] == 1)[0])
+        A.append(idxlist)
+    
+    #init Lq, LQ, Lr
+    LQ = LLRin #decoded variable bits LLR
+
+    #Variable nodes to checking nodes LLR, Lq[m,n] = 0 if H[m,n]=0
+    #m is check node index, n is variable index, 
+    Lq = np.zeros((M,N)) 
+    
+    #checking nodes to variable nodes, Lr[i,j] = 0 if H[i,j]=0
+    Lr = np.zeros((M,N)) 
+        
+    for iter in range(L):
+        #for each layer, where M is number of check nodes, which is also the number of layers in layered decoding
+        for m in range(M):
+            # A[m] is the list of variable node indices that connect to check node m
+
+            #generate layer m variable node -> check node LLR
+            sel_Lq = LQ[A[m]] - Lr[m,A[m]]
+            
+            #update Lr for layer m using min-sum processing
+            if algo == 'layered_BP':
+                Lr[m,A[m]] = _layered_BP_process(sel_Lq, A[m])
+            else:
+                Lr[m,A[m]] = _layered_min_sum_process(sel_Lq, A[m], alpha, beta)
+        
+            #update LQ with index that connect to layer m
+            LQ[A[m]] = sel_Lq + Lr[m,A[m]]
+
+        #LQ to ck hard coded bit
+        ck, status = _do_parity_check(LQ, H)
+        if status:
+            return ck, status
+    
+    return ck, status
+
+def _do_parity_check(LQ, H):
+    N = LQ.size
+    #hard decision
+    ck = np.zeros(N,'i1') #hard coded bits
+    ck[LQ >= 0] = 0
+    ck[LQ < 0] = 1
+    
+    #parity check first
+    S = (H @ ck.T) % 2    
+    if not np.any(S): 
+        #if S is all zero sequence, decoding success, return Tue
+        return ck, True
+    else:
+        return ck, False
+
+def _layered_min_sum_process(sel_Lq, V_m, alpha, beta):
+    """ mixed min-sim processing
+    alpha = 1, beta =0: min-sum
+    alpha < 1, beta = 0: normalized min-sum
+    alpha = 1, beta >0: offset min-sum
+    alpha <1, beta >0: mixed min-sum
+    """
+    sel_Lr = np.zeros(sel_Lq.shape, dtype=np.float32)
+    zero_value_list = list(np.where(sel_Lq==0)[0])
+    
+    if len(zero_value_list) == 0:
+        #normal case, no zero value
+        sign_prod = np.prod(np.sign(sel_Lq))
+        sorted_abs_v = np.sort(np.abs(sel_Lq))
+
+        first_min = sorted_abs_v[0]
+        second_min = sorted_abs_v[1]
+        for idx, n in enumerate(V_m):
+            if np.abs(sel_Lq[idx]) == first_min:
+                minv = second_min
+            else:
+                minv = first_min
+                
+            sel_minv = max(minv - beta, 0) #offset min-sum  
+            sel_Lr[idx] = alpha * sign_prod * np.sign(sel_Lq[idx]) * sel_minv
+    elif len(zero_value_list) == 1:
+        #only one zero value, only zero value related Lr is non-zero
+        zero_idx = zero_value_list[0]
+        
+        if zero_idx == 0:
+            sign_prod = np.prod(np.sign(sel_Lq[1:]))
+            min_v = np.min(np.abs(sel_Lq[1:]))
+        elif zero_idx == sel_Lq.size-1: #last bit is zero
+            sign_prod = np.prod(np.sign(sel_Lq[0:zero_idx]))
+            min_v = np.min(np.abs(sel_Lq[0:zero_idx]))
+        else:
+            sign_prod = np.prod(np.sign(sel_Lq[0:zero_idx]))*np.prod(np.sign(sel_Lq[zero_idx+1:]))
+            min_v = min(np.min(np.abs(sel_Lq[0:zero_idx])),np.min(np.abs(sel_Lq[zero_idx+1:])))
+        
+        sel_minv = max(min_v - beta, 0) #offset min-sum  
+        sel_Lr[zero_idx] = alpha * sign_prod *sel_minv 
+    else:
+        #>=2 zero values. all sel_Lr are zero
+        pass
+    
+    return sel_Lr
+    
 def _BP_process(sel_Lq, A, Lr,m):
     #calculate Lr with BP processing
     
@@ -174,6 +308,35 @@ def _BP_process(sel_Lq, A, Lr,m):
             Lr[m,n] = 0
     
     return Lr
+
+def _layered_BP_process(sel_Lq, V_m):
+    #calculate Lr with BP processing
+    
+    sel_Lr = np.zeros(sel_Lq.shape, dtype=np.float32)
+    zero_value_list = list(np.where(sel_Lq==0)[0])
+    
+    if len(zero_value_list) == 0:
+        #normal case, no zero value
+        tanh_Lq = np.tanh(sel_Lq/2)
+        prod_v = np.prod(tanh_Lq)
+        for idx, n in enumerate(V_m):
+            tmp2 = prod_v/tanh_Lq[idx]
+            if tmp2 >= 1:
+                sel_Lr[idx] = 2 * 19.07 #atanh(1) = infinite, set 19.07 as maximum value
+            elif tmp2 <= -1:
+                sel_Lr[idx] = -2 * 19.07 #atanh(-1) = negative infinite, set 19.07 as maximum value
+            else:
+                sel_Lr[idx] = 2 * np.arctanh(tmp2)
+    elif len(zero_value_list) == 1:
+        tanh_Lq = np.tanh(sel_Lq/2)
+        #only one zero value, only zero value related Lr is non-zero
+        zero_idx = zero_value_list[0]
+        sel_Lr[zero_idx] = np.prod(tanh_Lq[0:zero_idx]) * np.prod(tanh_Lq[zero_idx+1:])
+    else:
+        #>=2 zero values. all Lr are zero
+        pass
+    
+    return sel_Lr
 
 def _min_sum_process(sel_Lq, A, Lr,m, alpha, beta):
     """ mixed min-sim processing
@@ -272,11 +435,14 @@ if __name__ == "__main__":
     for filename in file_lists:
         print("count= {}, filename= {}".format(count, filename))
         count += 1
-        test_ldpc_decoder_soft.test_nr_ldpc_decode_BP(filename)
-        test_ldpc_decoder_soft.test_nr_ldpc_decode_min_sum(filename)
-        test_ldpc_decoder_soft.test_nr_ldpc_decode_NMS(filename)
-        test_ldpc_decoder_soft.test_nr_ldpc_decode_OMS(filename)
-        test_ldpc_decoder_soft.test_nr_ldpc_decode_mixed_min_sum(filename)
+        if 1:
+            test_ldpc_decoder_soft.test_nr_ldpc_decode_BP(filename)
+            test_ldpc_decoder_soft.test_nr_ldpc_decode_min_sum(filename)
+            test_ldpc_decoder_soft.test_nr_ldpc_decode_NMS(filename)
+            test_ldpc_decoder_soft.test_nr_ldpc_decode_OMS(filename)
+            test_ldpc_decoder_soft.test_nr_ldpc_decode_layed_mixed_min_sum(filename)
+        test_ldpc_decoder_soft.test_nr_ldpc_decode_layed_mixed_min_sum(filename)
+        test_ldpc_decoder_soft.test_nr_ldpc_decode_layed_BP(filename)
 
 
 

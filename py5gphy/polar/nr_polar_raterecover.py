@@ -37,12 +37,12 @@ def ratemrecover_polar(LLRin, K, N, iBIL, LLR_limit=20):
     if E >= N: #repetition, add repeted LLR together
         offset = 0
         while offset + N <= E:
-            outN += LLRin[offset:offset+N]
+            outN += inE[offset:offset+N]
             offset += N
         
         if offset < E:
             len = E - offset
-            outN[0:len] += LLRin[offset:]
+            outN[0:len] += inE[offset:]
     else:
         if (K/E) <= (7/16): #puncturing, put at the end,puncturing bits LLR = 0
             outN[N-E:N] = inE

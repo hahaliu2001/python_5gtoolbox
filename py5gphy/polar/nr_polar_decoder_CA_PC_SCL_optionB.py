@@ -33,7 +33,7 @@ def nr_decode_polar_SCL_optionB(LLRin, E, K, L, nMax, iIL, CRCLEN=24, padCRC=0, 
     
     #get F array, PC array and other values
     F, qPC, N, nPC, nPCwm = polar_construct.construct(K, E, nMax)
-    assert (K > nPC) <= E #38.212 5.3.1
+    assert (K + nPC) <= E #38.212 5.3.1
     assert (N <= 2**nMax) and (N >= 2**5) #38.212 5.3.1
     assert LLRin.size == N
        
